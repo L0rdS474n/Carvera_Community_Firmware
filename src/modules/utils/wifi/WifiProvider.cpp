@@ -7,6 +7,7 @@
 
 #include "WifiProvider.h"
 
+#include <cstdarg>
 #include "brd_cfg.h"
 #include "M8266HostIf.h"
 
@@ -35,6 +36,7 @@
 #include "libs/StreamOutput.h"
 
 #include "platform_memory.h" // Needed for AHB allocator
+#include "libs/compiler.h"
 
 #include "port_api.h"
 #include "InterruptIn.h"
@@ -58,7 +60,7 @@
 #define XBUFF_LENGTH	8208
 extern unsigned char xbuff[XBUFF_LENGTH];
 extern unsigned char fbuff[4096];
-__attribute__((section("AHBSRAM1"), aligned(4))) char WifiSerialbuff[544];
+char WifiSerialbuff[544] LOCATED_IN_AHBSRAM;
 
 
 
@@ -103,6 +105,8 @@ WifiProvider::WifiProvider()
 	udp_link_no = 1;
 	wifi_init_ok = false;
 	has_data_flag = false;
+	makera_command_pending = false;
+	makera_pending_payload_len = 0;
 	connection_fail_count = 0;
 	sta_stable_seconds = 0;
 	ap_auto_disable = true;
@@ -370,20 +374,17 @@ void WifiProvider::receive_wifi_data() {
 				}
 				break;
 			}
-			case PTYPE_CTRL_MULTI: {
-				struct SerialMessage message;
-				message.message.assign(WifiSerialbuff+5, data_len-3);
-				message.stream = this;
-				THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message );
+			case PTYPE_CTRL_MULTI:
+			case PTYPE_FILE_START:
+				// Defer to on_main_loop — same as SerialConsole. Commands like
+				// suspend/abort call wait_for_idle(), which re-enters ON_IDLE; handling
+				// them here would nest receive_wifi_data/puts on shared SPI buffers and
+				// drop the controller connection.
+				if (data_len >= 3) {
+					makera_pending_payload_len = data_len - 3;
+					makera_command_pending = true;
+				}
 				break;
-			}
-			case PTYPE_FILE_START: {
-				struct SerialMessage message;
-				message.message.assign(WifiSerialbuff+5,data_len-3);
-				message.stream = this;
-				THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message );
-				break;
-			}
 				
 			default:
 				break;
@@ -626,7 +627,8 @@ void WifiProvider::on_idle(void *argument)
  {
 	if (THEKERNEL->is_uploading()) return;
 
-	if (has_data_flag || M8266WIFI_SPI_Has_DataReceived()) {
+	// Do not receive another Makera frame while a deferred command still owns WifiSerialbuff
+	if (!makera_command_pending && (has_data_flag || M8266WIFI_SPI_Has_DataReceived())) {
 		has_data_flag = false;
 		receive_wifi_data();
 	}
@@ -665,22 +667,35 @@ void WifiProvider::on_idle(void *argument)
 
 void WifiProvider::on_main_loop(void *argument)
 {
-    if (communication_protocol == PROTOCOL_SMOOTHIE) {
-		if( this->has_char('\n') ){
-			string received;
-			received.reserve(20);
-			while(1){
-			char c;
-			this->buffer.pop_front(c);
-			if( c == '\n' ){
-					struct SerialMessage message;
-					message.message = received;
-					message.stream = this;
-					THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message );
-					return;
-				}else{
-					received += c;
-				}
+	if (communication_protocol == PROTOCOL_MAKERA) {
+		if (makera_command_pending) {
+			struct SerialMessage message;
+			message.message.assign(WifiSerialbuff + 5, makera_pending_payload_len);
+			message.stream = this;
+			message.line = 0;
+
+			makera_command_pending = false;
+			makera_pending_payload_len = 0;
+			THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message);
+		}
+		return;
+	}
+
+	if ( this->has_char('\n') ){
+		string received;
+		received.reserve(20);
+		while(1){
+		char c;
+		this->buffer.pop_front(c);
+		if( c == '\n' ){
+				struct SerialMessage message;
+				message.message = received;
+				message.stream = this;
+				message.line = 0;
+				THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message );
+				return;
+			}else{
+				received += c;
 			}
 		}
 	}
@@ -711,65 +726,76 @@ void WifiProvider::PacketMessage(char cmd, const char* s, int size)
 
 int WifiProvider::printfcmd(const char cmd, const char *format, ...)
 {
-	char b[64];
+	char b[256];
     char *buffer;
-    // Make the message
     va_list args;
     va_start(args, format);
+    va_list args_copy;
+    va_copy(args_copy, args);
 
-    int size = vsnprintf(b, 64, format, args) + 1; // we add one to take into account space for the terminating \0
+    int len = vsnprintf(b, sizeof(b), format, args);
+    va_end(args);
 
-    if (size < 64) {
+    if (len < 0) {
+        va_end(args_copy);
+        return -1;
+    } else if ((size_t)len < sizeof(b)) {
+        va_end(args_copy);
         buffer = b;
     } else {
-        buffer = new char[size];
-        vsnprintf(buffer, size, format, args);
+        buffer = new char[len + 1];
+        vsnprintf(buffer, len + 1, format, args_copy);
+        va_end(args_copy);
     }
-    va_end(args);
 
 	if (communication_protocol == PROTOCOL_SMOOTHIE) {
 		puts(buffer, strlen(buffer));
 	} else {
-		PacketMessage(PTYPE_DIAG_RES, buffer, strlen(buffer));
+		PacketMessage(cmd, buffer, strlen(buffer));
 	}
-//    puts(buffer, strlen(buffer));
-	
 
     if (buffer != b)
         delete[] buffer;
 
-    return size - 1;
+    return len;
 }
 
 int WifiProvider::printf(const char *format, ...)
 {
-	char b[64];
+	char b[256];
     char *buffer;
-    // Make the message
     va_list args;
     va_start(args, format);
+    va_list args_copy;
+    va_copy(args_copy, args);
 
-    int size = vsnprintf(b, 64, format, args) + 1; // we add one to take into account space for the terminating \0
-
-    if (size < 64) {
-        buffer = b;
-    } else {
-        buffer = new char[size];
-        vsnprintf(buffer, size, format, args);
-    }
+    int len = vsnprintf(b, sizeof(b), format, args);
     va_end(args);
 
+    if (len < 0) {
+        va_end(args_copy);
+        return -1;
+    } else if ((size_t)len < sizeof(b)) {
+        va_end(args_copy);
+        buffer = b;
+    } else {
+        buffer = new char[len + 1];
+        vsnprintf(buffer, len + 1, format, args_copy);
+        va_end(args_copy);
+    }
 
 	if (communication_protocol == PROTOCOL_SMOOTHIE) {
 		puts(buffer, strlen(buffer));
 	} else {
-		PacketMessage(PTYPE_DIAG_RES, buffer, strlen(buffer));
+		// Match StreamOutput: NORMAL_INFO (not DIAG_RES). Controllers treat
+		// console/info lines as NORMAL_INFO; DIAG_RES is for diagnose payloads.
+		PacketMessage(PTYPE_NORMAL_INFO, buffer, strlen(buffer));
 	}
 
     if (buffer != b)
         delete[] buffer;
 
-    return size - 1;
+    return len;
 }
 
 int WifiProvider::puts(const char* s, int size)
@@ -1034,9 +1060,6 @@ void WifiProvider::on_gcode_received(void *argument)
 				gcode->stream->printf("broadcast: %s\n", broadcast);
 			} else if (gcode->subcode == 7) {
 				gcode->stream->printf("aaaaaaa\n");
-				if (communication_protocol == PROTOCOL_SMOOTHIE) {
-					gcode->stream->printf("test buffer: %s\n", test_buffer.c_str());
-				}
 			}
 
 		} else if (gcode->m == 482) {

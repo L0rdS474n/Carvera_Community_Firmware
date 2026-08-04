@@ -73,10 +73,8 @@ private:
     void PacketMessage(char cmd, const char* s, int size);
 
     mbed::InterruptIn *wifi_interrupt_pin; // Interrupt pin for measuring speed
-    float probe_slow_rate;
 
     RingBuffer<char, 256> buffer; // Receive buffer
-    string test_buffer;
 
 	u8 WifiData[WIFI_DATA_MAX_SIZE];
 
@@ -103,7 +101,10 @@ private:
     	volatile bool query_flag:1;
     	volatile bool diagnose_flag:1;
     	volatile bool has_data_flag:1;
+    	volatile bool makera_command_pending:1;
     };
+    // Payload length for deferred Makera CTRL_MULTI / FILE_START (bytes at WifiSerialbuff+5)
+    uint16_t makera_pending_payload_len;
     ParseState currentState = WAIT_HEADER;    
     int ptrData;
     int ptr_xbuff;
